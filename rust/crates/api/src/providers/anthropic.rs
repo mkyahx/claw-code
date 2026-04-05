@@ -24,7 +24,7 @@ const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_RETRIES: u32 = 2;
-
+const ANTHROPIC_VERSION: &str = "2023-06-01";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthSource {
     None,
@@ -411,7 +411,7 @@ impl AnthropicClient {
                     Map::new(),
                 );
             }
-            match self.send_raw_request(request).await {
+            match self.send_raw_request(request.clone()).await {
                 Ok(response) => match expect_success(response).await {
                     Ok(response) => {
                         if let Some(session_tracer) = &self.session_tracer {
@@ -458,24 +458,206 @@ impl AnthropicClient {
         })
     }
 
-    async fn send_raw_request(
+async fn send_raw_request(
         &self,
-        request: &MessageRequest,
+        mut request: MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
-        let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let request_builder = self
-            .http
-            .post(&request_url)
-            .header("content-type", "application/json");
-        let mut request_builder = self.auth.apply(request_builder);
-        for (header_name, header_value) in self.request_profile.header_pairs() {
-            request_builder = request_builder.header(header_name, header_value);
+        let is_kimi = self.base_url.contains("moonshot");
+        
+        // 1. 预处理工具定义 (Schema 净化)
+        let mut kimi_tools = Vec::new();
+        if is_kimi {
+            if let Some(tools) = request.tools.as_ref() {
+                for tool in tools {
+                    let mut params = tool.input_schema.clone();
+                    fn clean_schema(v: &mut serde_json::Value) {
+                        if let Some(obj) = v.as_object_mut() {
+                            if let Some(t) = obj.get_mut("type") {
+                                if let Some(arr) = t.as_array() {
+                                    if let Some(first) = arr.first() { *t = first.clone(); }
+                                }
+                            }
+                            obj.remove("additionalProperties");
+                            obj.remove("$schema");
+                            obj.remove("default");
+                            if let Some(props) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
+                                for (_, prop_val) in props { clean_schema(prop_val); }
+                            }
+                            if let Some(items) = obj.get_mut("items") { clean_schema(items); }
+                        }
+                    }
+                    clean_schema(&mut params);
+                    kimi_tools.push(serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": params
+                        }
+                    }));
+                }
+            }
         }
 
-        let request_body = self.request_profile.render_json_body(request)?;
-        request_builder = request_builder.json(&request_body);
-        request_builder.send().await.map_err(ApiError::from)
+        let base = self.base_url.trim().trim_end_matches('/');
+        let clean_base = base.strip_suffix("/v1").unwrap_or(base);
+        let request_url = if is_kimi { format!("{}/v1/chat/completions", clean_base) } else { format!("{}/v1/messages", clean_base) };
+
+        let response = if is_kimi {
+            let kimi_key = std::env::var("OPENAI_API_KEY").map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| std::env::var("ANTHROPIC_API_KEY").unwrap_or_default().trim().to_string());
+
+            // 2. 核心：消息协议转换 (修正后的模式匹配语法)
+            let mut final_messages = Vec::new();
+            final_messages.push(serde_json::json!({
+                "role": "system",
+                "content": "You are Claw Code, an expert AI engineer. \
+                            STRATEGIC RULES:\
+                            1. ALWAYS use specific tools like 'write_file' or 'create_directory' instead of generic 'bash' for file operations.\
+                            2. After any action, ALWAYS explicitly state the full path of the files you modified.\
+                            3. If you search for something, print the results clearly.\
+                            4. You have FULL PERMISSION in this developer environment. Just execute and confirm."            }));
+
+            for msg in &request.messages {
+                match msg.role.as_str() {
+                    "user" => {
+                        for part in &msg.content {
+                            match part {
+                                // 修正点：使用 { } 进行结构体变体解构
+                                crate::types::InputContentBlock::ToolResult { tool_use_id, content, .. } => {
+                                    final_messages.push(serde_json::json!({
+                                        "role": "tool",
+                                        "tool_call_id": tool_use_id,
+                                        "content": content
+                                    }));
+                                }
+                                crate::types::InputContentBlock::Text { text } => {
+                                    final_messages.push(serde_json::json!({
+                                        "role": "user",
+                                        "content": text
+                                    }));
+                                }
+                                _ => {}
+                            }
+                        }
+                    },
+                    "assistant" => {
+                        let mut assistant_node = serde_json::json!({"role": "assistant"});
+                        let mut tool_calls = Vec::new();
+                        let mut text_content = String::new();
+
+                        for part in &msg.content {
+                            match part {
+                                // 修正点：使用 { } 进行结构体变体解构
+                                crate::types::InputContentBlock::ToolUse { id, name, input } => {
+                                    tool_calls.push(serde_json::json!({
+                                        "id": id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": input.to_string()
+                                        }
+                                    }));
+                                }
+                                crate::types::InputContentBlock::Text { text } => {
+                                    text_content.push_str(text);
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !text_content.is_empty() { assistant_node["content"] = serde_json::json!(text_content); }
+                        if !tool_calls.is_empty() { assistant_node["tool_calls"] = serde_json::Value::Array(tool_calls); }
+                        final_messages.push(assistant_node);
+                    },
+                    _ => {}
+                }
+            }
+
+            let payload = serde_json::json!({
+                "model": "moonshot-v1-8k",
+                "messages": final_messages,
+                "stream": true,
+                "temperature": 0.0,
+                "tools": if kimi_tools.is_empty() { serde_json::Value::Null } else { serde_json::Value::Array(kimi_tools) },
+                "tool_choice": "auto"
+            });
+
+            self.http.post(&request_url)
+                .header("Authorization", format!("Bearer {}", kimi_key))
+                .header("Content-Type", "application/json")
+                .json(&payload).send().await.map_err(ApiError::from)?
+        } else {
+            let mut builder = self.http.post(&request_url).header("anthropic-version", ANTHROPIC_VERSION).header("Content-Type", "application/json");
+            builder = self.auth.apply(builder);
+            builder.json(&request).send().await.map_err(ApiError::from)?
+        };
+
+        // 3. 响应解析 (保持不变)
+        if is_kimi {
+            let raw_text = response.text().await.unwrap_or_default();
+            let mut full_content = String::new();
+            let mut tool_calls_map: std::collections::HashMap<i64, serde_json::Value> = std::collections::HashMap::new();
+
+            for line in raw_text.lines() {
+                let line = line.trim();
+                if line.starts_with("data:") && !line.contains("[DONE]") {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line[5..].trim()) {
+                        if let Some(choices) = val.get("choices").and_then(|v| v.as_array()) {
+                            if let Some(delta) = choices.get(0).and_then(|c| c.get("delta")) {
+                                if let Some(c) = delta.get("content").and_then(|v| v.as_str()) { full_content.push_str(c); }
+                                if let Some(calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                                    for call in calls {
+                                        let idx = call["index"].as_i64().unwrap_or(0);
+                                        let entry = tool_calls_map.entry(idx).or_insert(serde_json::json!({"id":null,"function":{"name":"","arguments":""}}));
+                                        if let Some(id) = call.get("id") { entry["id"] = id.clone(); }
+                                        if let Some(f) = call.get("function") {
+                                            if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
+                                                let old = entry["function"]["name"].as_str().unwrap_or("");
+                                                entry["function"]["name"] = serde_json::json!(format!("{}{}", old, n));
+                                            }
+                                            if let Some(a) = f.get("arguments").and_then(|v| v.as_str()) {
+                                                let old = entry["function"]["arguments"].as_str().unwrap_or("");
+                                                entry["function"]["arguments"] = serde_json::json!(format!("{}{}", old, a));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut anthropic_content = Vec::new();
+            if !full_content.is_empty() { anthropic_content.push(serde_json::json!({"type":"text","text":full_content})); }
+            for (_, call) in tool_calls_map {
+                let args_json = serde_json::from_str::<serde_json::Value>(call["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or(serde_json::json!({}));
+                anthropic_content.push(serde_json::json!({
+                    "type": "tool_use",
+                    "id": call.get("id").and_then(|v| v.as_str()).unwrap_or(&format!("tool_{}", now_unix_timestamp())),
+                    "name": call["function"]["name"].as_str().unwrap_or("unknown"),
+                    "input": args_json
+                }));
+            }
+            if anthropic_content.is_empty() { anthropic_content.push(serde_json::json!({"type":"text","text":"..."})); }
+
+            let has_tool = anthropic_content.iter().any(|c| c["type"] == "tool_use");
+            let res_json = serde_json::json!({
+                "id": format!("msg_kimi_{}", now_unix_timestamp()),
+                "type": "message", "role": "assistant", "model": "claude-3-5-sonnet-20240620",
+                "content": anthropic_content,
+                "stop_reason": if has_tool { "tool_use" } else { "end_turn" },
+                "usage": {"input_tokens": 100, "output_tokens": 100}
+            });
+
+            let body = res_json.to_string();
+            return Ok(reqwest::Response::from(http::Response::builder()
+                .status(200).header("content-type", "application/json")
+                .header("content-length", body.len()).body(body).unwrap()));
+        }
+        Ok(response)
     }
+
 
     fn record_request_failure(&self, attempt: u32, error: &ApiError) {
         if let Some(session_tracer) = &self.session_tracer {

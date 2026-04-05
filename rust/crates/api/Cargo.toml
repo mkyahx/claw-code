@@ -12,6 +12,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 telemetry = { path = "../telemetry" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
-
+http = "1.0"
 [lints]
 workspace = true
